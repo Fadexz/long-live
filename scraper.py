@@ -1,5 +1,3 @@
-#!/bin/env python3
-
 import click
 import os
 import re
@@ -7,9 +5,16 @@ import requests
 import sys
 import time
 
+import concurrent.futures
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 from lxml import html
 from pprint import pprint
 from urllib.parse import unquote, urljoin
+
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 
 
 class Scraper:
@@ -29,11 +34,16 @@ class Scraper:
         self.count = 1
         self.total = 0
 
+        self.lock = threading.Lock()
+
     def build_url(self, link):
         return urljoin(self.base_url, link)
 
     def set_html_tree(self, url):
-        r = self.s.get(url)
+        s = requests.Session()
+        retries = Retry(total=5, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+        s.mount('http://', HTTPAdapter(max_retries=retries))
+        r = s.get(url)
         self.tree = html.fromstring(r.text)
 
     def set_page_path(self, title=None, subtitle=None):
@@ -50,6 +60,7 @@ class Scraper:
         self.path = [x
                      .replace("/", " & ")
                      .replace(":", " -")
+                     .replace("*", "-")
                      .replace("?", "")
                      .replace("\"", "")
                      .replace("|", "-")
@@ -121,6 +132,25 @@ class Scraper:
             return True
 
         return False
+    
+    def download_image(self, image_url, filename):
+        s = requests.Session()
+        retries = Retry(total=5, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+        s.mount('http://', HTTPAdapter(max_retries=retries))
+
+        r = s.get(image_url)
+
+        location = os.path.join(self.save_location, *self.path, filename)
+
+        os.makedirs(os.path.dirname(location), exist_ok=True)
+
+        with open(location, 'wb') as f:
+                f.write(r.content)
+
+        with self.lock:
+            print("|   |-- saved " + image_url.rpartition('/')[2] + " as " + filename)
+            self.count += 1
+            self.total += 1
 
     def get_album_page(self, url, page):
         if page > 1:
@@ -131,23 +161,26 @@ class Scraper:
             print("|   |-- PAGE " + str(page) + " - SKIPPED")
             return
 
-        print("|   |-- PAGE " + str(page))
-
         images = [x.rpartition('/')[2] for x in links]
-        for i in range(len(links)):
-            image_url = self.build_url(links[i])
-            r = self.s.get(image_url)
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            for i in range(len(links)):
+                with self.lock:
+                    image_url = self.build_url(links[i])
+                    filename = str(self.count).zfill(self.get_album_size()) + "." + links[i].rpartition('.')[2].lower()
+                    self.count += 1
+                    executor.submit(self.download_image, image_url, filename)
 
-            filename = str(self.count).zfill(self.get_album_size()) + "." + links[i].rpartition('.')[2]
-            location = os.path.join(self.save_location, *self.path, filename)
+    def last_album_page_saved(self):
+        path = os.path.join(self.save_location, *self.path)
+        if os.path.isdir(path):
+            os.chdir(path)
+            saved = os.listdir(os.getcwd())
 
-            print("|   |   |-- saving " + images[i] + " as " + filename)
-            os.makedirs(os.path.dirname(location), exist_ok=True)
-            with open(location, 'wb') as f:
-                f.write(r.content)
+            last_page_url = self.build_url(self.get_image_links()[-1])
+            if str(self.get_album_size()) + "." + last_page_url.rpartition('.')[2] in saved:
+                return True
 
-            self.count += 1
-            self.total += 1
+        return False
 
     def get_album(self, url, title=None, subtitle=None):
         self.count = 1
@@ -156,16 +189,22 @@ class Scraper:
         self.set_page_path(title, subtitle)
 
         print("SAVING\n"
-              + "|-- " + unquote(url) + "\n"
-              + "|-- " + "/".join(self.path))
+                + "|-- " + unquote(url) + "\n"
+                + "|-- " + "/".join(self.path) + "\n"
+                + "|-- Pages: " + str(self.get_page_count()))
 
         pages = self.get_page_count()
-        for i in range(1, pages + 1):
-            if i == 1:
-                self.get_album_page(url, i)
-            else:
-                page_url = url + "&page=" + str(i)
-                self.get_album_page(page_url, i)
+        with ThreadPoolExecutor(max_workers=10) as executor:  # Adjust max_workers as needed
+            futures = []
+            for i in range(1, pages + 1):
+                if i == 1:
+                    futures.append(executor.submit(self.get_album_page, url, i))
+                else:
+                    page_url = url + "&page=" + str(i)
+                    futures.append(executor.submit(self.get_album_page, page_url, i))
+
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
 
     def get_album_url(self, stat):
         url = stat.xpath('../../..//span[@class="alblink"]/a/@href')[0]
@@ -268,7 +307,7 @@ def main():
     print(str(sys.argv))
 
     if len(sys.argv) > 3:
-        save_location = os.path.abspath(sys.argv[1])
+        save_location = sys.argv[1]
         base_url = sys.argv[2]
         start_url = sys.argv[3]
 
